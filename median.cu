@@ -1,4 +1,4 @@
-/*
+/**
  * Copyright 1993-2013 NVIDIA Corporation.  All rights reserved.
  *
  * Please refer to the NVIDIA end user license agreement (EULA) associated
@@ -9,496 +9,195 @@
  *
  */
 
-/*
- * This sample implements a conjugate graident solver on GPU
- * using CUBLAS and CUSPARSE
+/**
+ * Vector addition: C = A + B.
  *
+ * This sample is a very basic sample that implements element by element
+ * vector addition. It is the same as the sample illustrating Chapter 2
+ * of the programming guide with some additions like error checking.
  */
 
-// includes, system
-#include <stdlib.h>
 #include <stdio.h>
-#include <string.h>
 
-/* Using updated (v2) interfaces to cublas and cusparse */
+// For the CUDA runtime routines (prefixed with "cuda_")
 #include <cuda_runtime.h>
-#include <cusparse_v2.h>
-#include <cublas_v2.h>
 
-// Utilities and system includes
-#include <helper_functions.h>  // helper for shared functions common to CUDA SDK samples
-#include <helper_cuda.h>       // helper function CUDA error checking and intialization
-
-const char *sSDKname     = "conjugateGradient";
-
-double mclock(){
-     struct timeval tp;
-
-     double sec,usec;
-     gettimeofday( &tp, NULL );
-     sec    = double( tp.tv_sec );
-     usec   = double( tp.tv_usec )/1E6;
-     return sec + usec;
-}
-
-
-#define dot_BS     32
-#define kernel_BS  32
-
-/* genTridiag: generate a random tridiagonal symmetric matrix */
-void genTridiag(int *I, int *J, float *val, int N, int nz)
+/**
+ * CUDA Kernel Device code
+ *
+ * Computes the vector addition of A and B into C. The 3 vectors have the same
+ * number of elements numElements.
+ */
+__global__ void
+vectorAdd(const float *A, const float *B, float *C, int numElements)
 {
-    double RAND_MAXi = 1e6;
-    double val_r     = 12.345 * 1e5;
-    
-    I[0] = 0, J[0] = 0, J[1] = 1;
-    val[0] = (float)val_r/RAND_MAXi + 10.0f;
-    val[1] = (float)val_r/RAND_MAXi;
-    int start;
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
 
-    for (int i = 1; i < N; i++)
+    if (i < numElements)
     {
-        if (i > 1)
-        {
-            I[i] = I[i-1]+3;
-        }
-        else
-        {
-            I[1] = 2;
-        }
-
-        start = (i-1)*3 + 2;
-        J[start] = i - 1;
-        J[start+1] = i;
-
-        if (i < N-1)
-        {
-            J[start+2] = i + 1;
-        }
-
-        val[start] = val[start-1];
-        val[start+1] = (float)val_r/RAND_MAXi + 10.0f;
-
-        if (i < N-1)
-        {
-            val[start+2] = (float)val_r/RAND_MAXi;
-        }
+        C[i] = A[i] + B[i];
     }
-
-    I[N] = nz;
 }
 
-
-void cgs_basic(int argc, char **argv, int N, int M){
-
-    //int M = 0, N = 0, 
-    int nz = 0, *I = NULL, *J = NULL;
-    float *val = NULL;
-    const float tol = 1e-10f;
-    const int max_iter = 1000;
-    float *x;
-    float *rhs;
-    float a, b, na, r0, r1;
-    int *d_col, *d_row;
-    float *d_val, *d_x, dot;
-    float *d_r, *d_p, *d_Ax;
-    int k;
-    float alpha, beta, alpham1;
-
-    // This will pick the best possible CUDA capable device
-    cudaDeviceProp deviceProp;
-    int devID = findCudaDevice(argc, (const char **)argv);
-
-    if (devID < 0)
-    {
-        printf("exiting...\n");
-        exit(EXIT_SUCCESS);
-    }
-
-    checkCudaErrors(cudaGetDeviceProperties(&deviceProp, devID));
-
-    // Statistics about the GPU device
-    printf("> GPU device has %d Multi-Processors, SM %d.%d compute capabilities\n\n",
-           deviceProp.multiProcessorCount, deviceProp.major, deviceProp.minor);
-
-    int version = (deviceProp.major * 0x10 + deviceProp.minor);
-
-    if (version < 0x11)
-    {
-        printf("%s: requires a minimum CUDA compute 1.1 capability\n", sSDKname);
-        cudaDeviceReset();
-        exit(EXIT_SUCCESS);
-    }
-
-    /* Generate a random tridiagonal symmetric matrix in CSR format */
-    //M = N = 32*64;//10; //1048576;
-    printf("M = %d, N = %d\n", M, N);
-    nz = (N-2)*3 + 4;
-    I = (int *)malloc(sizeof(int)*(N+1));
-    J = (int *)malloc(sizeof(int)*nz);
-    val = (float *)malloc(sizeof(float)*nz);
-    genTridiag(I, J, val, N, nz);
-
-    /*
-    for (int i = 0; i < nz; i++){
-        printf("%d\t", J[i]);
-    }
-    printf("\n");
-    for (int i = 0; i < nz; i++){
-        printf("%2f\t", val[i]);
-    }
-    */
-
-    x = (float *)malloc(sizeof(float)*N);
-    rhs = (float *)malloc(sizeof(float)*N);
-
-    for (int i = 0; i < N; i++)
-    {
-        rhs[i] = 1.0;
-        x[i] = 0.0;
-    }
-
-    /* Get handle to the CUBLAS context */
-    cublasHandle_t cublasHandle = 0;
-    cublasStatus_t cublasStatus;
-    cublasStatus = cublasCreate(&cublasHandle);
-
-    checkCudaErrors(cublasStatus);
-
-    /* Get handle to the CUSPARSE context */
-    cusparseHandle_t cusparseHandle = 0;
-    cusparseStatus_t cusparseStatus;
-    cusparseStatus = cusparseCreate(&cusparseHandle);
-
-    checkCudaErrors(cusparseStatus);
-
-    cusparseMatDescr_t descr = 0;
-    cusparseStatus = cusparseCreateMatDescr(&descr);
-
-    checkCudaErrors(cusparseStatus);
-
-    cusparseSetMatType(descr,CUSPARSE_MATRIX_TYPE_GENERAL);
-    cusparseSetMatIndexBase(descr,CUSPARSE_INDEX_BASE_ZERO);
-
-    checkCudaErrors(cudaMalloc((void **)&d_col, nz*sizeof(int)));
-    checkCudaErrors(cudaMalloc((void **)&d_row, (N+1)*sizeof(int)));
-    checkCudaErrors(cudaMalloc((void **)&d_val, nz*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_x, N*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_r, N*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_p, N*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_Ax, N*sizeof(float)));
-
-    cudaMemcpy(d_col, J, nz*sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_row, I, (N+1)*sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_val, val, nz*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_x, x, N*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_r, rhs, N*sizeof(float), cudaMemcpyHostToDevice);
-
-    alpha = 1.0;
-    alpham1 = -1.0;
-    beta = 0.0;
-    r0 = 0.;
-
-
-    double t_start = mclock();
-    cusparseScsrmv(cusparseHandle,CUSPARSE_OPERATION_NON_TRANSPOSE, N, N, nz, &alpha, descr, d_val, d_row, d_col, d_x, &beta, d_Ax);
-
-    cublasSaxpy(cublasHandle, N, &alpham1, d_Ax, 1, d_r, 1);                                // PODMIEN FUNCKJE (I)
-    cublasStatus = cublasSdot(cublasHandle, N, d_r, 1, d_r, 1, &r1);                        // PODMIEN FUNCKJE (II)
-
-    k = 1;
-
-    while (r1 > tol*tol && k <= max_iter)
-    {
-        if (k > 1)
-        {
-            b = r1 / r0;
-            cublasStatus = cublasSscal(cublasHandle, N, &b, d_p, 1);                        // PODMIEN FUNCKJE (I)
-            cublasStatus = cublasSaxpy(cublasHandle, N, &alpha, d_r, 1, d_p, 1);            // PODMIEN FUNCKJE (I)
-        }
-        else
-        {
-            cublasStatus = cublasScopy(cublasHandle, N, d_r, 1, d_p, 1);                    // PODMIEN FUNCKJE (I)
-        }
-
-        cusparseScsrmv(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, N, N, nz, &alpha, descr, d_val, d_row, d_col, d_p, &beta, d_Ax); // PODMIEN FUNCKJE (III)
-        cublasStatus = cublasSdot(cublasHandle, N, d_p, 1, d_Ax, 1, &dot);                  // PODMIEN FUNCKJE (II)
-        a = r1 / dot;
-
-        cublasStatus = cublasSaxpy(cublasHandle, N, &a, d_p, 1, d_x, 1);                    // PODMIEN FUNCKJE (I)
-        na = -a;
-        cublasStatus = cublasSaxpy(cublasHandle, N, &na, d_Ax, 1, d_r, 1);                  // PODMIEN FUNCKJE (I)
-
-        r0 = r1;
-        cublasStatus = cublasSdot(cublasHandle, N, d_r, 1, d_r, 1, &r1);                    // PODMIEN FUNCKJE (II)
-        cudaThreadSynchronize();
-        printf("iteration = %3d, residual = %e\n", k, sqrt(r1));
-        k++;
-    }
-    printf("TIME OF CGS_BASIC = %f\n", mclock() - t_start);
-
-    cudaMemcpy(x, d_x, N*sizeof(float), cudaMemcpyDeviceToHost);
-
-    float rsum, diff, err = 0.0;
-
-    for (int i = 0; i < N; i++)
-    {
-        rsum = 0.0;
-
-        for (int j = I[i]; j < I[i+1]; j++)
-        {
-            rsum += val[j]*x[J[j]];
-        }
-
-        diff = fabs(rsum - rhs[i]);
-
-        if (diff > err)
-        {
-            err = diff;
-        }
-    }
-
-    cusparseDestroy(cusparseHandle);
-    cublasDestroy(cublasHandle);
-
-    free(I);
-    free(J);
-    free(val);
-    free(x);
-    free(rhs);
-    cudaFree(d_col);
-    cudaFree(d_row);
-    cudaFree(d_val);
-    cudaFree(d_x);
-    cudaFree(d_r);
-    cudaFree(d_p);
-    cudaFree(d_Ax);
-
-    cudaDeviceReset();
-
-    printf("Test Summary:  Error amount = %e\n", err);
-    //exit((k <= max_iter) ? 0 : 1);
-
-
-}
-void cgs_TODO(int argc, char **argv, int N, int M){
-
-    //int M = 0, N = 0, 
-    int nz = 0, *I = NULL, *J = NULL;
-    float *val = NULL;
-    const float tol = 1e-10f;
-    const int max_iter = 1000;
-    float *x;
-    float *rhs;
-    float a, b, na, r0, r1;
-    int *d_col, *d_row;
-    float *d_val, *d_x, dot;
-    float *d_r, *d_p, *d_Ax;
-    int k;
-    float alpha, beta, alpham1;
-
-    // This will pick the best possible CUDA capable device
-    cudaDeviceProp deviceProp;
-    int devID = findCudaDevice(argc, (const char **)argv);
-
-    if (devID < 0)
-    {
-        printf("exiting...\n");
-        exit(EXIT_SUCCESS);
-    }
-
-    checkCudaErrors(cudaGetDeviceProperties(&deviceProp, devID));
-
-    // Statistics about the GPU device
-    printf("> GPU device has %d Multi-Processors, SM %d.%d compute capabilities\n\n",
-           deviceProp.multiProcessorCount, deviceProp.major, deviceProp.minor);
-
-    int version = (deviceProp.major * 0x10 + deviceProp.minor);
-
-    if (version < 0x11)
-    {
-        printf("%s: requires a minimum CUDA compute 1.1 capability\n", sSDKname);
-        cudaDeviceReset();
-        exit(EXIT_SUCCESS);
-    }
-
-    /* Generate a random tridiagonal symmetric matrix in CSR format */
-    //M = N = 32*64;//10; //1048576;
-    printf("M = %d, N = %d\n", M, N);
-    nz = (N-2)*3 + 4;
-    I = (int *)malloc(sizeof(int)*(N+1));
-    J = (int *)malloc(sizeof(int)*nz);
-    val = (float *)malloc(sizeof(float)*nz);
-    genTridiag(I, J, val, N, nz);
-
-    /*
-    for (int i = 0; i < nz; i++){
-        printf("%d\t", J[i]);
-    }
-    printf("\n");
-    for (int i = 0; i < nz; i++){
-        printf("%2f\t", val[i]);
-    }
-    */
-
-    x = (float *)malloc(sizeof(float)*N);
-    rhs = (float *)malloc(sizeof(float)*N);
-
-    for (int i = 0; i < N; i++)
-    {
-        rhs[i] = 1.0;
-        x[i] = 0.0;
-    }
-
-    /* Get handle to the CUBLAS context */
-    cublasHandle_t cublasHandle = 0;
-    cublasStatus_t cublasStatus;
-    cublasStatus = cublasCreate(&cublasHandle);
-
-    checkCudaErrors(cublasStatus);
-
-    /* Get handle to the CUSPARSE context */
-    cusparseHandle_t cusparseHandle = 0;
-    cusparseStatus_t cusparseStatus;
-    cusparseStatus = cusparseCreate(&cusparseHandle);
-
-    checkCudaErrors(cusparseStatus);
-
-    cusparseMatDescr_t descr = 0;
-    cusparseStatus = cusparseCreateMatDescr(&descr);
-
-    checkCudaErrors(cusparseStatus);
-
-    cusparseSetMatType(descr,CUSPARSE_MATRIX_TYPE_GENERAL);
-    cusparseSetMatIndexBase(descr,CUSPARSE_INDEX_BASE_ZERO);
-
-    checkCudaErrors(cudaMalloc((void **)&d_col, nz*sizeof(int)));
-    checkCudaErrors(cudaMalloc((void **)&d_row, (N+1)*sizeof(int)));
-    checkCudaErrors(cudaMalloc((void **)&d_val, nz*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_x, N*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_r, N*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_p, N*sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **)&d_Ax, N*sizeof(float)));
-
-    cudaMemcpy(d_col, J, nz*sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_row, I, (N+1)*sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_val, val, nz*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_x, x, N*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_r, rhs, N*sizeof(float), cudaMemcpyHostToDevice);
-
-    alpha = 1.0;
-    alpham1 = -1.0;
-    beta = 0.0;
-    r0 = 0.;
-
-
-    // sparse matrix vector product: d_Ax = A * d_x
-    cusparseScsrmv(cusparseHandle,CUSPARSE_OPERATION_NON_TRANSPOSE, N, N, nz, &alpha, descr, d_val, d_row, d_col, d_x, &beta, d_Ax);  // PODMIEN FUNCKJE (ZADANIE-I)
-
-
-    //azpy: d_r = d_r + alpham1 * d_Ax
-    cublasSaxpy(cublasHandle, N, &alpham1, d_Ax, 1, d_r, 1);        			    // PODMIEN FUNCKJE (ZADANIE-I)
-    //dot:  r1 = d_r * d_r
-    cublasStatus = cublasSdot(cublasHandle, N, d_r, 1, d_r, 1, &r1);                        // PODMIEN FUNCKJE (ZADANIE-III)
-
-    k = 1;
-
-    while (r1 > tol*tol && k <= max_iter)
-    {
-        if (k > 1)
-        {
-            b = r1 / r0;
-	    //scal: d_p = b * d_p
-            cublasStatus = cublasSscal(cublasHandle, N, &b, d_p, 1);                        // PODMIEN FUNCKJE (ZADANIE-I)
-	    //axpy:  d_p = d_p + alpha * d_r
-            cublasStatus = cublasSaxpy(cublasHandle, N, &alpha, d_r, 1, d_p, 1);            // PODMIEN FUNCKJE (ZADANIE-I)
-        }
-        else
-        {
-            //cpy: d_p = d_r
-            cublasStatus = cublasScopy(cublasHandle, N, d_r, 1, d_p, 1);                    // PODMIEN FUNCKJE (ZADANIE-I)
-        }
-
-        //sparse matrix-vector product: d_Ax = A * d_p
-        cusparseScsrmv(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, N, N, nz, &alpha, descr, d_val, d_row, d_col, d_p, &beta, d_Ax); // PODMIEN FUNCKJE (ZADANIE-II)
-        cublasStatus = cublasSdot(cublasHandle, N, d_p, 1, d_Ax, 1, &dot);                  // PODMIEN FUNCKJE (ZADANIE-III)
-        a = r1 / dot;
-
-        //axpy: d_x = d_x + a*d_p
-        cublasStatus = cublasSaxpy(cublasHandle, N, &a, d_p, 1, d_x, 1);                    // PODMIEN FUNCKJE (ZADANIE-I)
-        na = -a;
-	 
-        //axpy:  d_r = d_r + na * d_Ax
-        cublasStatus = cublasSaxpy(cublasHandle, N, &na, d_Ax, 1, d_r, 1);                  // PODMIEN FUNCKJE (ZADANIE-I)
-
-        r0 = r1;
-	
-        //dot: r1 = d_r * d_r
-        cublasStatus = cublasSdot(cublasHandle, N, d_r, 1, d_r, 1, &r1);                    // PODMIEN FUNCKJE (ZADANIE-III)
-        cudaThreadSynchronize();
-        printf("iteration = %3d, residual = %e\n", k, sqrt(r1));
-        k++;
-    }
-
-    cudaMemcpy(x, d_x, N*sizeof(float), cudaMemcpyDeviceToHost);
-
-    float rsum, diff, err = 0.0;
-
-    for (int i = 0; i < N; i++)
-    {
-        rsum = 0.0;
-
-        for (int j = I[i]; j < I[i+1]; j++)
-        {
-            rsum += val[j]*x[J[j]];
-        }
-
-        diff = fabs(rsum - rhs[i]);
-
-        if (diff > err)
-        {
-            err = diff;
-        }
-    }
-
-    cusparseDestroy(cusparseHandle);
-    cublasDestroy(cublasHandle);
-
-    free(I);
-    free(J);
-    free(val);
-    free(x);
-    free(rhs);
-    cudaFree(d_col);
-    cudaFree(d_row);
-    cudaFree(d_val);
-    cudaFree(d_x);
-    cudaFree(d_r);
-    cudaFree(d_p);
-    cudaFree(d_Ax);
-
-    cudaDeviceReset();
-
-    printf("Test Summary:  Error amount = %e\n", err);
-    //exit((k <= max_iter) ? 0 : 1);
-
-
-}
-
-
-
-
-
-
-
-int main(int argc, char **argv)
+/**
+ * Host main routine
+ */
+int
+main(void)
 {
-    //int N = 1e6;//1 << 20;
-    //int N = 256 * (1<<10)  -10 ; //1e6;//1 << 20;
-    int N = 1e5;
-    int M = N; 
-    
-    cgs_basic(argc, argv, N, M);
-    
-    cgs_TODO(argc, argv, N, M);
+    // Error code to check return values for CUDA calls
+    cudaError_t err = cudaSuccess;
+
+    // Print the vector length to be used, and compute its size
+    int numElements = 50000;
+    size_t size = numElements * sizeof(float);
+    printf("[Vector addition of %d elements]\n", numElements);
+
+    // Allocate the host input vector A
+    float *h_A = (float *)malloc(size);
+
+    // Allocate the host input vector B
+    float *h_B = (float *)malloc(size);
+
+    // Allocate the host output vector C
+    float *h_C = (float *)malloc(size);
+
+    // Verify that allocations succeeded
+    if (h_A == NULL || h_B == NULL || h_C == NULL)
+    {
+        fprintf(stderr, "Failed to allocate host vectors!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Initialize the host input vectors
+    for (int i = 0; i < numElements; ++i)
+    {
+        h_A[i] = rand()/(float)RAND_MAX;
+        h_B[i] = rand()/(float)RAND_MAX;
+    }
+
+    // Allocate the device input vector A
+    float *d_A = NULL;
+    err = cudaMalloc((void **)&d_A, size);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to allocate device vector A (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // Allocate the device input vector B
+    float *d_B = NULL;
+    err = cudaMalloc((void **)&d_B, size);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to allocate device vector B (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // Allocate the device output vector C
+    float *d_C = NULL;
+    err = cudaMalloc((void **)&d_C, size);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to allocate device vector C (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy the host input vectors A and B in host memory to the device input vectors in
+    // device memory
+    printf("Copy input data from the host memory to the CUDA device\n");
+    err = cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to copy vector A from host to device (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    err = cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to copy vector B from host to device (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // Launch the Vector Add CUDA Kernel
+    int threadsPerBlock = 256;
+    int blocksPerGrid =(numElements + threadsPerBlock - 1) / threadsPerBlock;
+    printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
+    vectorAdd<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, numElements);
+    err = cudaGetLastError();
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy the device result vector in device memory to the host result vector
+    // in host memory.
+    printf("Copy output data from the CUDA device to the host memory\n");
+    err = cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to copy vector C from device to host (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // Verify that the result vector is correct
+    for (int i = 0; i < numElements; ++i)
+    {
+        if (fabs(h_A[i] + h_B[i] - h_C[i]) > 1e-5)
+        {
+            fprintf(stderr, "Result verification failed at element %d!\n", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    printf("Test PASSED\n");
+
+    // Free device global memory
+    err = cudaFree(d_A);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to free device vector A (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+    err = cudaFree(d_B);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to free device vector B (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+    err = cudaFree(d_C);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to free device vector C (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // Free host memory
+    free(h_A);
+    free(h_B);
+    free(h_C);
+
+    // Reset the device and exit
+    err = cudaDeviceReset();
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to deinitialize the device! error=%s\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Done\n");
+    return 0;
 }
+
